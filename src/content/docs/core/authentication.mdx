@@ -11,10 +11,6 @@ import {
   Code,
 } from "@astrojs/starlight/components";
 
-import importedCodeStandardWorker from "../../../../../starters/standard/src/worker.tsx?raw";
-import importedCodeStandardAuthFunctions from "../../../../../starters/standard/src/app/pages/user/functions.ts?raw";
-import importedCodeStandardLogin from "../../../../../starters/standard/src/app/pages/user/Login.tsx?raw";
-
 We've baked authentication right into the [**standard starter**](https://github.com/redwoodjs/sdk/tree/main/starters/standard), giving you everything you need to handle users, sessions, and logins out of the box. The standard starter uses **passkeys ([WebAuthn](https://webauthn.guide/))** for passwordless authentication, **session persistence via [Cloudflare Durable Objects](https://developers.cloudflare.com/durable-objects/)**, and **bot protection with [Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/)**. The database layer is powered by **[Cloudflare D1](https://developers.cloudflare.com/d1/)** and **[Prisma](https://www.prisma.io/)**.
 
 <Aside type="caution">
@@ -155,12 +151,72 @@ When a request comes in, we:
 3. If it's valid, load the session data from the **Durable Object**.
 4. If there's an active session, we pull the user ID from it and load the user from the **database ([D1](https://developers.cloudflare.com/d1/) + [Prisma](https://www.prisma.io/))**.
 
-<Code
-  language="typescript"
-  title="src/worker.tsx"
-  code={importedCodeStandardWorker}
-  collapse={"2-17, 19-19, 21-22, 31-31, 33-47"}
-/>
+``` tsx title="src/worker.tsx" collapse={"2-17, 19-19, 21-22, 31-31, 33-47"}
+import { defineApp, ErrorResponse } from "@redwoodjs/sdk/worker";
+import { route, render, prefix } from "@redwoodjs/sdk/router";
+import { Document } from "@/app/Document";
+import { Home } from "@/app/pages/Home";
+import { setCommonHeaders } from "@/app/headers";
+import { userRoutes } from "@/app/pages/user/routes";
+import { sessions, setupSessionStore } from "./session/store";
+import { Session } from "./session/durableObject";
+import { db, setupDb } from "./db";
+import type { User } from "@prisma/client";
+import { env } from "cloudflare:workers";
+export { SessionDurableObject } from "./session/durableObject";
+
+export type AppContext = {
+  session: Session | null;
+  user: User | null;
+};
+
+export default defineApp([
+  setCommonHeaders(),
+  async ({ ctx, request, headers }) => {
+    await setupDb(env);
+    setupSessionStore(env);
+
+    try {
+      ctx.session = await sessions.load(request);
+    } catch (error) {
+      if (error instanceof ErrorResponse && error.code === 401) {
+        await sessions.remove(request, headers);
+        headers.set("Location", "/user/login");
+
+        return new Response(null, {
+          status: 302,
+          headers,
+        });
+      }
+
+      throw error;
+    }
+
+    if (ctx.session?.userId) {
+      ctx.user = await db.user.findUnique({
+        where: {
+          id: ctx.session.userId,
+        },
+      });
+    }
+  },
+  render(Document, [
+    route("/", () => new Response("Hello, World!")),
+    route("/protected", [
+      ({ ctx }) => {
+        if (!ctx.user) {
+          return new Response(null, {
+            status: 302,
+            headers: { Location: "/user/login" },
+          });
+        }
+      },
+      Home,
+    ]),
+    prefix("/user", userRoutes),
+  ]),
+]);
+```
 
 #### Why Durable Objects?
 
@@ -185,19 +241,261 @@ For more on passkeys, see [passkeys.dev](https://passkeys.dev/).
 5. The signed challenge is sent back to the server and verified.
 6. If successful, the session is updated with the **user ID**.
 
-<Code
-  language="typescript"
-  title="src/app/pages/user/Login.tsx"
-  code={importedCodeStandardLogin}
-  collapse={"1-18, 20-24, 41-90"}
-/>
+```tsx title="src/app/pages/user/Login.tsx" collapse={"1-18, 20-24, 41-90"}
+"use client";
 
-<Code
-  language="typescript"
-  title="src/app/pages/user/functions.ts"
-  code={importedCodeStandardAuthFunctions}
-  collapse={"1-109, 111-112, 114-116, 119-169"}
-/>
+import { useState, useTransition } from "react";
+import {
+  startAuthentication,
+  startRegistration,
+} from "@simplewebauthn/browser";
+import {
+  finishPasskeyLogin,
+  finishPasskeyRegistration,
+  startPasskeyLogin,
+  startPasskeyRegistration,
+} from "./functions";
+
+export function Login() {
+  const [username, setUsername] = useState("");
+  const [result, setResult] = useState("");
+  const [isPending, startTransition] = useTransition();
+
+  const passkeyLogin = async () => {
+    // 1. Get a challenge from the worker
+    const options = await startPasskeyLogin();
+
+    // 2. Ask the browser to sign the challenge
+    const login = await startAuthentication({ optionsJSON: options });
+
+    // 3. Give the signed challenge to the worker to finish the login process
+    const success = await finishPasskeyLogin(login);
+
+    if (!success) {
+      setResult("Login failed");
+    } else {
+      setResult("Login successful!");
+    }
+  };
+
+  const passkeyRegister = async () => {
+    // 1. Get a challenge from the worker
+    const options = await startPasskeyRegistration(username);
+
+    // 2. Ask the browser to sign the challenge
+    const registration = await startRegistration({ optionsJSON: options });
+
+    // 3. Give the signed challenge to the worker to finish the registration process
+    const success = await finishPasskeyRegistration(username, registration);
+
+    if (!success) {
+      setResult("Registration failed");
+    } else {
+      setResult("Registration successful!");
+    }
+  };
+
+  const handlePerformPasskeyLogin = () => {
+    startTransition(() => void passkeyLogin());
+  };
+
+  const handlePerformPasskeyRegister = () => {
+    startTransition(() => void passkeyRegister());
+  };
+
+  return (
+    <>
+      <input
+        type="text"
+        value={username}
+        onChange={(e) => setUsername(e.target.value)}
+        placeholder="Username"
+      />
+      <button onClick={handlePerformPasskeyLogin} disabled={isPending}>
+        {isPending ? <>...</> : "Login with passkey"}
+      </button>
+      <button onClick={handlePerformPasskeyRegister} disabled={isPending}>
+        {isPending ? <>...</> : "Register with passkey"}
+      </button>
+      {result && <div>{result}</div>}
+    </>
+  );
+}
+```
+
+```tsx title="src/app/pages/user/functions.ts" collapse={"1-109, 111-112, 114-116, 119-169"}
+"use server";
+import {
+  generateRegistrationOptions,
+  generateAuthenticationOptions,
+  verifyRegistrationResponse,
+  verifyAuthenticationResponse,
+  RegistrationResponseJSON,
+  AuthenticationResponseJSON,
+} from "@simplewebauthn/server";
+
+import { sessions } from "@/session/store";
+import { requestInfo } from "@redwoodjs/sdk/worker";
+import { db } from "@/db";
+import { env } from "cloudflare:workers";
+
+const IS_DEV = process.env.NODE_ENV === "development";
+
+function getWebAuthnConfig(request: Request) {
+  const rpID = env.WEBAUTHN_RP_ID ?? new URL(request.url).hostname;
+  const rpName = IS_DEV ? "Development App" : env.WEBAUTHN_APP_NAME;
+  return {
+    rpName,
+    rpID,
+  };
+}
+
+export async function startPasskeyRegistration(username: string) {
+  const { rpName, rpID } = getWebAuthnConfig(requestInfo.request);
+  const { headers } = requestInfo;
+
+  const options = await generateRegistrationOptions({
+    rpName,
+    rpID,
+    userName: username,
+    authenticatorSelection: {
+      // Require the authenticator to store the credential, enabling a username-less login experience
+      residentKey: "required",
+      // Prefer user verification (biometric, PIN, etc.), but allow authentication even if it's not available
+      userVerification: "preferred",
+    },
+  });
+
+  await sessions.save(headers, { challenge: options.challenge });
+
+  return options;
+}
+
+export async function startPasskeyLogin() {
+  const { rpID } = getWebAuthnConfig(requestInfo.request);
+  const { headers } = requestInfo;
+
+  const options = await generateAuthenticationOptions({
+    rpID,
+    userVerification: "preferred",
+    allowCredentials: [],
+  });
+
+  await sessions.save(headers, { challenge: options.challenge });
+
+  return options;
+}
+
+export async function finishPasskeyRegistration(
+  username: string,
+  registration: RegistrationResponseJSON,
+) {
+  const { request, headers } = requestInfo;
+  const { origin } = new URL(request.url);
+
+  const session = await sessions.load(request);
+  const challenge = session?.challenge;
+
+  if (!challenge) {
+    return false;
+  }
+
+  const verification = await verifyRegistrationResponse({
+    response: registration,
+    expectedChallenge: challenge,
+    expectedOrigin: origin,
+    expectedRPID: env.WEBAUTHN_RP_ID || new URL(request.url).hostname,
+  });
+
+  if (!verification.verified || !verification.registrationInfo) {
+    return false;
+  }
+
+  await sessions.save(headers, { challenge: null });
+
+  const user = await db.user.create({
+    data: {
+      username,
+    },
+  });
+
+  await db.credential.create({
+    data: {
+      userId: user.id,
+      credentialId: verification.registrationInfo.credential.id,
+      publicKey: verification.registrationInfo.credential.publicKey,
+      counter: verification.registrationInfo.credential.counter,
+    },
+  });
+
+  return true;
+}
+
+export async function finishPasskeyLogin(login: AuthenticationResponseJSON) {
+  const { request, headers } = requestInfo;
+  const { origin } = new URL(request.url);
+
+  const session = await sessions.load(request);
+  const challenge = session?.challenge;
+
+  if (!challenge) {
+    return false;
+  }
+
+  const credential = await db.credential.findUnique({
+    where: {
+      credentialId: login.id,
+    },
+  });
+
+  if (!credential) {
+    return false;
+  }
+
+  const verification = await verifyAuthenticationResponse({
+    response: login,
+    expectedChallenge: challenge,
+    expectedOrigin: origin,
+    expectedRPID: env.WEBAUTHN_RP_ID || new URL(request.url).hostname,
+    requireUserVerification: false,
+    credential: {
+      id: credential.credentialId,
+      publicKey: credential.publicKey,
+      counter: credential.counter,
+    },
+  });
+
+  if (!verification.verified) {
+    return false;
+  }
+
+  await db.credential.update({
+    where: {
+      credentialId: login.id,
+    },
+    data: {
+      counter: verification.authenticationInfo.newCounter,
+    },
+  });
+
+  const user = await db.user.findUnique({
+    where: {
+      id: credential.userId,
+    },
+  });
+
+  if (!user) {
+    return false;
+  }
+
+  await sessions.save(headers, {
+    userId: user.id,
+    challenge: null,
+  });
+
+  return true;
+}
+```
 
 ---
 
@@ -205,12 +503,87 @@ For more on passkeys, see [passkeys.dev](https://passkeys.dev/).
 
 Registration follows a very similar 3-step WebAuthn process as login:
 
-<Code
-  language="typescript"
-  title="src/app/pages/user/Login.tsx"
-  code={importedCodeStandardLogin}
-  collapse={"1-18, 20-41, 64-90"}
-/>
+```tsx title="src/app/pages/user/Login.tsx" collapse={"1-18, 20-41, 64-90"}
+"use client";
+
+import { useState, useTransition } from "react";
+import {
+  startAuthentication,
+  startRegistration,
+} from "@simplewebauthn/browser";
+import {
+  finishPasskeyLogin,
+  finishPasskeyRegistration,
+  startPasskeyLogin,
+  startPasskeyRegistration,
+} from "./functions";
+
+export function Login() {
+  const [username, setUsername] = useState("");
+  const [result, setResult] = useState("");
+  const [isPending, startTransition] = useTransition();
+
+  const passkeyLogin = async () => {
+    // 1. Get a challenge from the worker
+    const options = await startPasskeyLogin();
+
+    // 2. Ask the browser to sign the challenge
+    const login = await startAuthentication({ optionsJSON: options });
+
+    // 3. Give the signed challenge to the worker to finish the login process
+    const success = await finishPasskeyLogin(login);
+
+    if (!success) {
+      setResult("Login failed");
+    } else {
+      setResult("Login successful!");
+    }
+  };
+
+  const passkeyRegister = async () => {
+    // 1. Get a challenge from the worker
+    const options = await startPasskeyRegistration(username);
+
+    // 2. Ask the browser to sign the challenge
+    const registration = await startRegistration({ optionsJSON: options });
+
+    // 3. Give the signed challenge to the worker to finish the registration process
+    const success = await finishPasskeyRegistration(username, registration);
+
+    if (!success) {
+      setResult("Registration failed");
+    } else {
+      setResult("Registration successful!");
+    }
+  };
+
+  const handlePerformPasskeyLogin = () => {
+    startTransition(() => void passkeyLogin());
+  };
+
+  const handlePerformPasskeyRegister = () => {
+    startTransition(() => void passkeyRegister());
+  };
+
+  return (
+    <>
+      <input
+        type="text"
+        value={username}
+        onChange={(e) => setUsername(e.target.value)}
+        placeholder="Username"
+      />
+      <button onClick={handlePerformPasskeyLogin} disabled={isPending}>
+        {isPending ? <>...</> : "Login with passkey"}
+      </button>
+      <button onClick={handlePerformPasskeyRegister} disabled={isPending}>
+        {isPending ? <>...</> : "Register with passkey"}
+      </button>
+      {result && <div>{result}</div>}
+    </>
+  );
+}
+```
 
 One difference: we protect registrations with an extra layer of **bot protection** using [Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/).
 
@@ -225,16 +598,258 @@ Cloudflare has built-in bot protection, but it works by detecting and blocking m
 3. The token is sent to the backend along with the WebAuthn data.
 4. The backend verifies the token using `verifyTurnstileToken()` before completing registration.
 
-<Code
-  language="typescript"
-  title="src/app/pages/user/Login.tsx"
-  code={importedCodeStandardLogin}
-  collapse={"1-15, 18-18, 20-22, 24-41, 43-48, 57-62, 64-72, 76-88"}
-/>
+```tsx title="src/app/pages/user/Login.tsx" collapse={"1-15, 18-18, 20-22, 24-41, 43-48, 57-62, 64-72, 76-88"}
+"use client";
 
-<Code
-  language="typescript"
-  title="src/app/pages/user/functions.ts"
-  code={importedCodeStandardAuthFunctions}
-  collapse={"1-38, 40-43, 45-46, 55-93, 95-176"}
-/>
+import { useState, useTransition } from "react";
+import {
+  startAuthentication,
+  startRegistration,
+} from "@simplewebauthn/browser";
+import {
+  finishPasskeyLogin,
+  finishPasskeyRegistration,
+  startPasskeyLogin,
+  startPasskeyRegistration,
+} from "./functions";
+
+export function Login() {
+  const [username, setUsername] = useState("");
+  const [result, setResult] = useState("");
+  const [isPending, startTransition] = useTransition();
+
+  const passkeyLogin = async () => {
+    // 1. Get a challenge from the worker
+    const options = await startPasskeyLogin();
+
+    // 2. Ask the browser to sign the challenge
+    const login = await startAuthentication({ optionsJSON: options });
+
+    // 3. Give the signed challenge to the worker to finish the login process
+    const success = await finishPasskeyLogin(login);
+
+    if (!success) {
+      setResult("Login failed");
+    } else {
+      setResult("Login successful!");
+    }
+  };
+
+  const passkeyRegister = async () => {
+    // 1. Get a challenge from the worker
+    const options = await startPasskeyRegistration(username);
+
+    // 2. Ask the browser to sign the challenge
+    const registration = await startRegistration({ optionsJSON: options });
+
+    // 3. Give the signed challenge to the worker to finish the registration process
+    const success = await finishPasskeyRegistration(username, registration);
+
+    if (!success) {
+      setResult("Registration failed");
+    } else {
+      setResult("Registration successful!");
+    }
+  };
+
+  const handlePerformPasskeyLogin = () => {
+    startTransition(() => void passkeyLogin());
+  };
+
+  const handlePerformPasskeyRegister = () => {
+    startTransition(() => void passkeyRegister());
+  };
+
+  return (
+    <>
+      <input
+        type="text"
+        value={username}
+        onChange={(e) => setUsername(e.target.value)}
+        placeholder="Username"
+      />
+      <button onClick={handlePerformPasskeyLogin} disabled={isPending}>
+        {isPending ? <>...</> : "Login with passkey"}
+      </button>
+      <button onClick={handlePerformPasskeyRegister} disabled={isPending}>
+        {isPending ? <>...</> : "Register with passkey"}
+      </button>
+      {result && <div>{result}</div>}
+    </>
+  );
+}
+```
+
+```tsx title="src/app/pages/user/functions.ts" collapse={"1-38, 40-43, 45-46, 55-93, 95-176"}
+"use server";
+import {
+  generateRegistrationOptions,
+  generateAuthenticationOptions,
+  verifyRegistrationResponse,
+  verifyAuthenticationResponse,
+  RegistrationResponseJSON,
+  AuthenticationResponseJSON,
+} from "@simplewebauthn/server";
+
+import { sessions } from "@/session/store";
+import { requestInfo } from "@redwoodjs/sdk/worker";
+import { db } from "@/db";
+import { env } from "cloudflare:workers";
+
+const IS_DEV = process.env.NODE_ENV === "development";
+
+function getWebAuthnConfig(request: Request) {
+  const rpID = env.WEBAUTHN_RP_ID ?? new URL(request.url).hostname;
+  const rpName = IS_DEV ? "Development App" : env.WEBAUTHN_APP_NAME;
+  return {
+    rpName,
+    rpID,
+  };
+}
+
+export async function startPasskeyRegistration(username: string) {
+  const { rpName, rpID } = getWebAuthnConfig(requestInfo.request);
+  const { headers } = requestInfo;
+
+  const options = await generateRegistrationOptions({
+    rpName,
+    rpID,
+    userName: username,
+    authenticatorSelection: {
+      // Require the authenticator to store the credential, enabling a username-less login experience
+      residentKey: "required",
+      // Prefer user verification (biometric, PIN, etc.), but allow authentication even if it's not available
+      userVerification: "preferred",
+    },
+  });
+
+  await sessions.save(headers, { challenge: options.challenge });
+
+  return options;
+}
+
+export async function startPasskeyLogin() {
+  const { rpID } = getWebAuthnConfig(requestInfo.request);
+  const { headers } = requestInfo;
+
+  const options = await generateAuthenticationOptions({
+    rpID,
+    userVerification: "preferred",
+    allowCredentials: [],
+  });
+
+  await sessions.save(headers, { challenge: options.challenge });
+
+  return options;
+}
+
+export async function finishPasskeyRegistration(
+  username: string,
+  registration: RegistrationResponseJSON,
+) {
+  const { request, headers } = requestInfo;
+  const { origin } = new URL(request.url);
+
+  const session = await sessions.load(request);
+  const challenge = session?.challenge;
+
+  if (!challenge) {
+    return false;
+  }
+
+  const verification = await verifyRegistrationResponse({
+    response: registration,
+    expectedChallenge: challenge,
+    expectedOrigin: origin,
+    expectedRPID: env.WEBAUTHN_RP_ID || new URL(request.url).hostname,
+  });
+
+  if (!verification.verified || !verification.registrationInfo) {
+    return false;
+  }
+
+  await sessions.save(headers, { challenge: null });
+
+  const user = await db.user.create({
+    data: {
+      username,
+    },
+  });
+
+  await db.credential.create({
+    data: {
+      userId: user.id,
+      credentialId: verification.registrationInfo.credential.id,
+      publicKey: verification.registrationInfo.credential.publicKey,
+      counter: verification.registrationInfo.credential.counter,
+    },
+  });
+
+  return true;
+}
+
+export async function finishPasskeyLogin(login: AuthenticationResponseJSON) {
+  const { request, headers } = requestInfo;
+  const { origin } = new URL(request.url);
+
+  const session = await sessions.load(request);
+  const challenge = session?.challenge;
+
+  if (!challenge) {
+    return false;
+  }
+
+  const credential = await db.credential.findUnique({
+    where: {
+      credentialId: login.id,
+    },
+  });
+
+  if (!credential) {
+    return false;
+  }
+
+  const verification = await verifyAuthenticationResponse({
+    response: login,
+    expectedChallenge: challenge,
+    expectedOrigin: origin,
+    expectedRPID: env.WEBAUTHN_RP_ID || new URL(request.url).hostname,
+    requireUserVerification: false,
+    credential: {
+      id: credential.credentialId,
+      publicKey: credential.publicKey,
+      counter: credential.counter,
+    },
+  });
+
+  if (!verification.verified) {
+    return false;
+  }
+
+  await db.credential.update({
+    where: {
+      credentialId: login.id,
+    },
+    data: {
+      counter: verification.authenticationInfo.newCounter,
+    },
+  });
+
+  const user = await db.user.findUnique({
+    where: {
+      id: credential.userId,
+    },
+  });
+
+  if (!user) {
+    return false;
+  }
+
+  await sessions.save(headers, {
+    userId: user.id,
+    challenge: null,
+  });
+
+  return true;
+}
+```
